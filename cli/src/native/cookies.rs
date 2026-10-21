@@ -85,3 +85,67 @@ pub async fn clear_cookies(client: &CdpClient, session_id: &str) -> Result<(), S
         .await?;
     Ok(())
 }
+
+// app-storage
+/// Delete one cookie by name. CDP matches on `url` or `domain`; with neither
+/// given, fall back to the page's current URL.
+pub async fn delete_cookie(
+    client: &CdpClient,
+    session_id: &str,
+    name: &str,
+    domain: Option<&str>,
+    path: Option<&str>,
+    url: Option<&str>,
+    current_url: Option<&str>,
+) -> Result<(), String> {
+    let params = delete_cookie_params(name, domain, path, url, current_url);
+    client
+        .send_command("Network.deleteCookies", Some(params), Some(session_id))
+        .await?;
+    Ok(())
+}
+
+fn delete_cookie_params(
+    name: &str,
+    domain: Option<&str>,
+    path: Option<&str>,
+    url: Option<&str>,
+    current_url: Option<&str>,
+) -> Value {
+    let mut params = serde_json::Map::new();
+    params.insert("name".to_string(), json!(name));
+    if let Some(d) = domain {
+        params.insert("domain".to_string(), json!(d));
+    }
+    if let Some(p) = path {
+        params.insert("path".to_string(), json!(p));
+    }
+    let url = url.or(if domain.is_none() { current_url } else { None });
+    if let Some(u) = url {
+        params.insert("url".to_string(), json!(u));
+    }
+    Value::Object(params)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delete_cookie_params_defaults_to_current_url() {
+        let p = delete_cookie_params("sid", None, None, None, Some("http://h/x"));
+        assert_eq!(p, json!({ "name": "sid", "url": "http://h/x" }));
+    }
+
+    #[test]
+    fn delete_cookie_params_domain_skips_current_url() {
+        let p = delete_cookie_params("sid", Some(".h"), Some("/"), None, Some("http://h/x"));
+        assert_eq!(p, json!({ "name": "sid", "domain": ".h", "path": "/" }));
+    }
+
+    #[test]
+    fn delete_cookie_params_explicit_url_wins() {
+        let p = delete_cookie_params("sid", Some(".h"), None, Some("http://o/"), Some("http://h/"));
+        assert_eq!(p, json!({ "name": "sid", "domain": ".h", "url": "http://o/" }));
+    }
+}

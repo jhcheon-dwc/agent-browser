@@ -3463,3 +3463,98 @@ async fn e2e_headers_case_insensitive_no_duplicates() {
     let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
     assert_success(&resp);
 }
+
+// ---------------------------------------------------------------------------
+// app-storage: single-key storage remove and single-cookie delete
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn e2e_storage_remove_and_cookie_delete() {
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": "https://example.com" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    for (i, (ty, key)) in [("local", "keep"), ("local", "gone"), ("session", "세션")]
+        .iter()
+        .enumerate()
+    {
+        let resp = execute_command(
+            &json!({ "id": format!("s{}", i), "action": "storage_set", "type": ty, "key": key, "value": "v" }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+    }
+
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "storage_remove", "type": "local", "key": "gone" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["removed"], true);
+
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "storage_get", "type": "local" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let data = &get_data(&resp)["data"];
+    assert_eq!(data["keep"], "v");
+    assert!(data.get("gone").is_none(), "removed key should be gone");
+
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "storage_remove", "type": "session", "key": "세션" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "6", "action": "storage_get", "type": "session", "key": "세션" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert!(get_data(&resp)["value"].is_null());
+
+    for name in ["c_keep", "c_gone"] {
+        let resp = execute_command(
+            &json!({ "id": name, "action": "cookies_set", "name": name, "value": "1" }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+    }
+
+    // No url/domain: defaults to the current page URL.
+    let resp = execute_command(
+        &json!({ "id": "7", "action": "cookies_delete", "name": "c_gone" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["deleted"], true);
+
+    let resp = execute_command(&json!({ "id": "8", "action": "cookies_get" }), &mut state).await;
+    assert_success(&resp);
+    let cookies = get_data(&resp)["cookies"].as_array().unwrap();
+    assert!(cookies.iter().any(|c| c["name"] == "c_keep"));
+    assert!(!cookies.iter().any(|c| c["name"] == "c_gone"));
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}

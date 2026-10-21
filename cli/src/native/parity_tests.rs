@@ -192,6 +192,9 @@ const DOCUMENTED_ACTIONS: &[&str] = &[
     "mousemove",
     "mousedown",
     "mouseup",
+    // app-storage
+    "storage_remove",
+    "cookies_delete",
 ];
 
 fn minimal_command(action: &str, id: &str) -> Value {
@@ -364,6 +367,13 @@ fn minimal_command(action: &str, id: &str) -> Value {
         }
         "inserttext" => {
             obj.insert("text".to_string(), json!("test"));
+        }
+        // app-storage
+        "storage_remove" => {
+            obj.insert("key".to_string(), json!("test"));
+        }
+        "cookies_delete" => {
+            obj.insert("name".to_string(), json!("test"));
         }
         _ => {}
     }

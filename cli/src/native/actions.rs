@@ -1281,6 +1281,9 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "mousemove" => handle_mousemove(cmd, state).await,
         "mousedown" => handle_mousedown(cmd, state).await,
         "mouseup" => handle_mouseup(cmd, state).await,
+        // app-storage
+        "storage_remove" => handle_storage_remove(cmd, state).await,
+        "cookies_delete" => handle_cookies_delete(cmd, state).await,
         _ => Err(format!("Not yet implemented: {}", action)),
     };
 
@@ -2955,6 +2958,45 @@ async fn handle_storage_clear(cmd: &Value, state: &DaemonState) -> Result<Value,
     let storage_type = cmd.get("type").and_then(|v| v.as_str()).unwrap_or("local");
     storage::storage_clear(&mgr.client, &session_id, storage_type).await?;
     Ok(json!({ "cleared": true }))
+}
+
+// app-storage
+async fn handle_storage_remove(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
+    let storage_type = cmd.get("type").and_then(|v| v.as_str()).unwrap_or("local");
+    let key = cmd
+        .get("key")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing 'key' parameter")?;
+    storage::storage_remove(&mgr.client, &session_id, storage_type, key).await?;
+    Ok(json!({ "removed": true }))
+}
+
+async fn handle_cookies_delete(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
+    let name = cmd
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing 'name' parameter")?;
+    let str_param = |k: &str| {
+        cmd.get(k)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+    };
+    let current_url = mgr.get_url().await.ok();
+    cookies::delete_cookie(
+        &mgr.client,
+        &session_id,
+        name,
+        str_param("domain"),
+        str_param("path"),
+        str_param("url"),
+        current_url.as_deref(),
+    )
+    .await?;
+    Ok(json!({ "deleted": true }))
 }
 
 async fn handle_setcontent(cmd: &Value, state: &DaemonState) -> Result<Value, String> {

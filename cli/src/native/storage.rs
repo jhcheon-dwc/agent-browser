@@ -66,6 +66,25 @@ pub async fn storage_clear(
     Ok(())
 }
 
+// app-storage
+pub async fn storage_remove(
+    client: &CdpClient,
+    session_id: &str,
+    storage_type: &str,
+    key: &str,
+) -> Result<(), String> {
+    eval_simple(client, session_id, &storage_remove_js(storage_type, key)).await?;
+    Ok(())
+}
+
+fn storage_remove_js(storage_type: &str, key: &str) -> String {
+    format!(
+        "{}.removeItem({})",
+        storage_js_name(storage_type),
+        serde_json::to_string(key).unwrap_or_default()
+    )
+}
+
 fn storage_js_name(storage_type: &str) -> &str {
     match storage_type {
         "session" => "sessionStorage",
@@ -91,4 +110,22 @@ async fn eval_simple(client: &CdpClient, session_id: &str, js: &str) -> Result<V
     }
 
     Ok(result.result.value.unwrap_or(Value::Null))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // app-storage
+    #[test]
+    fn storage_remove_js_escapes_key() {
+        assert_eq!(
+            storage_remove_js("local", "a\"b"),
+            r#"localStorage.removeItem("a\"b")"#
+        );
+        assert_eq!(
+            storage_remove_js("session", "한글"),
+            r#"sessionStorage.removeItem("한글")"#
+        );
+    }
 }

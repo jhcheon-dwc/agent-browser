@@ -44,6 +44,12 @@ pub mod webdriver;
 #[allow(dead_code)]
 pub mod indexeddb;
 
+// app-cache-sw
+#[allow(dead_code)]
+pub mod cache_storage;
+#[allow(dead_code)]
+pub mod service_worker;
+
 #[cfg(test)]
 mod e2e_tests;
 #[cfg(test)]

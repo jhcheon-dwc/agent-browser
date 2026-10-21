@@ -200,6 +200,13 @@ const DOCUMENTED_ACTIONS: &[&str] = &[
     "indexeddb_data",
     "indexeddb_clear",
     "indexeddb_delete",
+    // app-cache-sw
+    "cache_list",
+    "cache_entries",
+    "cache_delete",
+    "service_workers",
+    "service_worker_unregister",
+    "service_worker_update",
 ];
 
 fn minimal_command(action: &str, id: &str) -> Value {
@@ -388,6 +395,14 @@ fn minimal_command(action: &str, id: &str) -> Value {
         }
         "indexeddb_delete" => {
             obj.insert("database".to_string(), json!("db"));
+        }
+
+        // app-cache-sw
+        "cache_entries" | "cache_delete" => {
+            obj.insert("cacheId".to_string(), json!("none"));
+        }
+        "service_worker_unregister" | "service_worker_update" => {
+            obj.insert("scopeURL".to_string(), json!("https://example.com/"));
         }
         _ => {}
     }

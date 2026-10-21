@@ -122,6 +122,18 @@ pub struct TrackedRequest {
     pub response_headers: Option<Value>,
     #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
+    /// CDP `Network.loadingFailed` errorText (e.g. "net::ERR_CONNECTION_REFUSED").
+    #[serde(rename = "errorText", skip_serializing_if = "Option::is_none")]
+    pub error_text: Option<String>,
+    /// Bytes on the wire, from `Network.loadingFinished`.
+    #[serde(rename = "encodedDataLength", skip_serializing_if = "Option::is_none")]
+    pub encoded_data_length: Option<i64>,
+    /// Wall-clock ms from request to loadingFinished/loadingFailed.
+    #[serde(rename = "durationMs", skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// CDP monotonic `timestamp` (seconds) of `Network.requestWillBeSent`.
+    #[serde(skip)]
+    pub cdp_timestamp: Option<f64>,
 }
 
 pub struct FetchPausedRequest {
@@ -212,6 +224,28 @@ pub struct DaemonState {
     pub stream_client: Option<Arc<RwLock<Option<Arc<CdpClient>>>>>,
     /// Stream server instance kept alive so the broadcast channel remains open.
     pub stream_server: Option<Arc<StreamServer>>,
+}
+
+/// Apply a `Network.loadingFinished` event to the matching HAR entry.
+fn har_update_loading_finished(har_entries: &mut [HarEntry], params: &Value) {
+    let request_id = params
+        .get("requestId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let timestamp = params.get("timestamp").and_then(|v| v.as_f64());
+    let encoded_data_length = params.get("encodedDataLength").and_then(|v| v.as_i64());
+    if let Some(entry) = har_entries
+        .iter_mut()
+        .rev()
+        .find(|e| e.request_id == request_id)
+    {
+        if let Some(ts) = timestamp {
+            entry.loading_finished_timestamp = Some(ts);
+        }
+        if let Some(len) = encoded_data_length {
+            entry.response_body_size = len;
+        }
+    }
 }
 
 impl DaemonState {
@@ -569,9 +603,24 @@ impl DaemonState {
                                     .as_ref()
                                     .and_then(|e| e.description.as_deref())
                                     .unwrap_or(&details.text);
+                                // Source location: the script URL when Chrome reports
+                                // one, else the top stack frame's URL.
+                                let top_frame_url = details
+                                    .stack_trace
+                                    .as_ref()
+                                    .and_then(|st| st.get("callFrames"))
+                                    .and_then(|f| f.get(0))
+                                    .and_then(|f| f.get("url"))
+                                    .and_then(|u| u.as_str())
+                                    .filter(|u| !u.is_empty());
+                                let url = details
+                                    .url
+                                    .as_deref()
+                                    .filter(|u| !u.is_empty())
+                                    .or(top_frame_url);
                                 self.event_tracker.add_error(
                                     text,
-                                    None,
+                                    url,
                                     details.line_number,
                                     details.column_number,
                                 );
@@ -664,6 +713,13 @@ impl DaemonState {
                                         status: None,
                                         response_headers: None,
                                         mime_type: None,
+                                        error_text: None,
+                                        encoded_data_length: None,
+                                        duration_ms: None,
+                                        cdp_timestamp: event
+                                            .params
+                                            .get("timestamp")
+                                            .and_then(|v| v.as_f64()),
                                     });
                                 }
                             }
@@ -740,30 +796,57 @@ impl DaemonState {
                                 }
                             }
                         }
-                        "Network.loadingFinished" if self.har_recording => {
+                        "Network.loadingFinished" | "Network.loadingFailed"
+                            if self.request_tracking =>
+                        {
                             let request_id = event
                                 .params
                                 .get("requestId")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("");
-                            let timestamp = event.params.get("timestamp").and_then(|v| v.as_f64());
-                            let encoded_data_length = event
-                                .params
-                                .get("encodedDataLength")
-                                .and_then(|v| v.as_i64());
+                            let end = event.params.get("timestamp").and_then(|v| v.as_f64());
                             if let Some(entry) = self
-                                .har_entries
+                                .tracked_requests
                                 .iter_mut()
                                 .rev()
                                 .find(|e| e.request_id == request_id)
                             {
-                                if let Some(ts) = timestamp {
-                                    entry.loading_finished_timestamp = Some(ts);
+                                // CDP monotonic timestamps: events are drained in
+                                // batches, so wall-clock receipt time is not usable.
+                                if let (Some(start), Some(end)) = (entry.cdp_timestamp, end) {
+                                    entry.duration_ms =
+                                        Some(((end - start) * 1000.0).max(0.0).round() as u64);
                                 }
-                                if let Some(len) = encoded_data_length {
-                                    entry.response_body_size = len;
+                                if event.method == "Network.loadingFailed" {
+                                    let text = event
+                                        .params
+                                        .get("errorText")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("failed");
+                                    let canceled = event
+                                        .params
+                                        .get("canceled")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false);
+                                    entry.error_text = Some(if canceled {
+                                        "canceled".to_string()
+                                    } else {
+                                        text.to_string()
+                                    });
+                                } else {
+                                    entry.encoded_data_length = event
+                                        .params
+                                        .get("encodedDataLength")
+                                        .and_then(|v| v.as_f64())
+                                        .map(|v| v as i64);
                                 }
                             }
+                            if self.har_recording && event.method == "Network.loadingFinished" {
+                                har_update_loading_finished(&mut self.har_entries, &event.params);
+                            }
+                        }
+                        "Network.loadingFinished" if self.har_recording => {
+                            har_update_loading_finished(&mut self.har_entries, &event.params);
                         }
                         "Page.screencastFrame" => {
                             // Frame broadcasting and acks are handled in real-time by the
@@ -1048,7 +1131,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "navigate" => handle_navigate(cmd, state).await,
         "url" => handle_url(state).await,
         "cdp_url" => handle_cdp_url(state),
-        "inspect" => handle_inspect(state).await,
+        "inspect" => handle_inspect(cmd, state).await,
         "title" => handle_title(state).await,
         "content" => handle_content(state).await,
         "evaluate" => handle_evaluate(cmd, state).await,
@@ -1073,7 +1156,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "ischecked" => handle_ischecked(cmd, state).await,
         "back" => handle_back(state).await,
         "forward" => handle_forward(state).await,
-        "reload" => handle_reload(state).await,
+        "reload" => handle_reload(cmd, state).await,
         "cookies_get" => handle_cookies_get(cmd, state).await,
         "cookies_set" => handle_cookies_set(cmd, state).await,
         "cookies_clear" => handle_cookies_clear(state).await,
@@ -1084,7 +1167,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "headers" => handle_headers(cmd, state).await,
         "offline" => handle_offline(cmd, state).await,
         "console" => handle_console(cmd, state).await,
-        "errors" => handle_errors(state).await,
+        "errors" => handle_errors(cmd, state).await,
         "state_save" => handle_state_save(cmd, state).await,
         "state_load" => handle_state_load(cmd, state).await,
         "state_list" | "state_show" | "state_clear" | "state_clean" | "state_rename" => {
@@ -1791,7 +1874,7 @@ fn handle_cdp_url(state: &DaemonState) -> Result<Value, String> {
     Ok(json!({ "cdpUrl": mgr.get_cdp_url() }))
 }
 
-async fn handle_inspect(state: &mut DaemonState) -> Result<Value, String> {
+async fn handle_inspect(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
 
     // Shut down any existing inspect server so we always target the current page
@@ -1805,10 +1888,14 @@ async fn handle_inspect(state: &mut DaemonState) -> Result<Value, String> {
 
     let server = InspectServer::start(proxy_handle, target_id, chrome_hp).await?;
     let url = format!("http://127.0.0.1:{}", server.port());
-    open_url_in_browser(&url);
+    // `"open": false` lets embedders (cmux) open the URL themselves.
+    let open = cmd.get("open").and_then(|v| v.as_bool()).unwrap_or(true);
+    if open {
+        open_url_in_browser(&url);
+    }
 
     state.inspect_server = Some(server);
-    Ok(json!({ "opened": true, "url": url }))
+    Ok(json!({ "opened": open, "url": url }))
 }
 
 fn open_url_in_browser(url: &str) {
@@ -2614,7 +2701,12 @@ async fn handle_forward(state: &mut DaemonState) -> Result<Value, String> {
     Ok(json!({ "url": url }))
 }
 
-async fn handle_reload(state: &mut DaemonState) -> Result<Value, String> {
+async fn handle_reload(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    // `"ignoreCache": true` = hard reload (bypass the HTTP cache).
+    let ignore_cache = cmd
+        .get("ignoreCache")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if let Some(ref wb) = state.webdriver_backend {
         if state.browser.is_none() {
             wb.reload().await?;
@@ -2628,7 +2720,11 @@ async fn handle_reload(state: &mut DaemonState) -> Result<Value, String> {
     let session_id = mgr.active_session_id()?.to_string();
 
     mgr.client
-        .send_command_no_params("Page.reload", Some(&session_id))
+        .send_command(
+            "Page.reload",
+            Some(json!({ "ignoreCache": ignore_cache })),
+            Some(&session_id),
+        )
         .await?;
 
     let mut rx = mgr.client.subscribe();
@@ -2910,7 +3006,11 @@ async fn handle_console(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
     }
 }
 
-async fn handle_errors(state: &DaemonState) -> Result<Value, String> {
+async fn handle_errors(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    if cmd.get("clear").and_then(|v| v.as_bool()).unwrap_or(false) {
+        state.event_tracker.error_entries.clear();
+        return Ok(json!({ "cleared": true }));
+    }
     Ok(state.event_tracker.get_errors_json())
 }
 

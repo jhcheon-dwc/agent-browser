@@ -283,6 +283,10 @@ pub struct EventTracker {
     pub console_entries: Vec<ConsoleEntry>,
     pub error_entries: Vec<ErrorEntry>,
     pub max_entries: usize,
+    /// Monotonic counts of entries ever added (survive trimming and clear),
+    /// so pollers can tell which entries are new.
+    pub console_total: u64,
+    pub error_total: u64,
 }
 
 impl EventTracker {
@@ -291,6 +295,8 @@ impl EventTracker {
             console_entries: Vec::new(),
             error_entries: Vec::new(),
             max_entries: 1000,
+            console_total: 0,
+            error_total: 0,
         }
     }
 
@@ -298,6 +304,7 @@ impl EventTracker {
         if self.console_entries.len() >= self.max_entries {
             self.console_entries.remove(0);
         }
+        self.console_total += 1;
         self.console_entries.push(ConsoleEntry {
             level: level.to_string(),
             text: text.to_string(),
@@ -314,6 +321,7 @@ impl EventTracker {
         if self.error_entries.len() >= self.max_entries {
             self.error_entries.remove(0);
         }
+        self.error_total += 1;
         self.error_entries.push(ErrorEntry {
             text: text.to_string(),
             url: url.map(String::from),
@@ -332,7 +340,7 @@ impl EventTracker {
             .iter()
             .map(|e| json!({ "type": e.level, "text": e.text }))
             .collect();
-        json!({ "messages": messages })
+        json!({ "messages": messages, "total": self.console_total })
     }
 
     pub fn get_errors_json(&self) -> Value {
@@ -348,7 +356,7 @@ impl EventTracker {
                 })
             })
             .collect();
-        json!({ "errors": entries })
+        json!({ "errors": entries, "total": self.error_total })
     }
 }
 

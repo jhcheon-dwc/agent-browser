@@ -3242,9 +3242,12 @@ async fn handle_viewport(cmd: &Value, state: &DaemonState) -> Result<Value, Stri
 
     mgr.set_viewport(width, height, scale, mobile).await?;
 
-    // Update stream server viewport so status messages and screencast use the new dimensions
+    // Update stream server viewport so status messages and screencast use the new
+    // dimensions, and resize a running screencast to the new device-pixel size.
     if let Some(ref server) = state.stream_server {
         server.set_viewport(width as u32, height as u32).await;
+        server.set_device_scale_factor(scale).await;
+        server.refresh_screencast().await;
     }
 
     Ok(json!({ "width": width, "height": height, "deviceScaleFactor": scale, "mobile": mobile }))
@@ -4273,6 +4276,8 @@ async fn handle_device(cmd: &Value, state: &DaemonState) -> Result<Value, String
     // Update stream server viewport so status messages and screencast use the new dimensions
     if let Some(ref server) = state.stream_server {
         server.set_viewport(width as u32, height as u32).await;
+        server.set_device_scale_factor(scale).await;
+        server.refresh_screencast().await;
     }
 
     Ok(json!({
@@ -4404,14 +4409,17 @@ async fn handle_screencast_start(cmd: &Value, state: &mut DaemonState) -> Result
         return Err("Screencast already active".to_string());
     }
 
-    // Use stored viewport as default for screencast dimensions
+    // Use stored viewport (in device pixels) as default for screencast dimensions
     let (default_w, default_h) = if let Some(ref server) = state.stream_server {
-        server.viewport().await
+        server.screencast_max_size().await
     } else {
         (1280, 720)
     };
     let format = cmd.get("format").and_then(|v| v.as_str()).unwrap_or("jpeg");
     let quality = cmd.get("quality").and_then(|v| v.as_i64()).unwrap_or(80) as i32;
+    if let Some(ref server) = state.stream_server {
+        server.set_screencast_format(format, quality).await;
+    }
     let max_width = cmd
         .get("maxWidth")
         .and_then(|v| v.as_i64())

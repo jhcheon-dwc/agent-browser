@@ -46,6 +46,8 @@ pub struct StreamServer {
     screencasting: Arc<Mutex<bool>>,
     viewport_width: Arc<Mutex<u32>>,
     viewport_height: Arc<Mutex<u32>>,
+    /// Shared screencast settings (device scale factor, image format, quality).
+    screencast_settings: Arc<Mutex<ScreencastSettings>>,
     shutdown_tx: watch::Sender<bool>,
     accept_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     cdp_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -102,6 +104,58 @@ impl StreamServer {
         (w, h)
     }
 
+    /// Set the device scale factor used to size screencast frames.
+    pub async fn set_device_scale_factor(&self, scale: f64) {
+        self.screencast_settings.lock().await.scale = scale;
+    }
+
+    /// Remember the image format/quality so restarts keep what the caller asked for.
+    pub async fn set_screencast_format(&self, format: &str, quality: i32) {
+        let mut s = self.screencast_settings.lock().await;
+        s.format = format.to_string();
+        s.quality = quality;
+    }
+
+    /// Screencast frame size limit in device pixels for the current viewport.
+    pub async fn screencast_max_size(&self) -> (i32, i32) {
+        let (w, h) = self.viewport().await;
+        let scale = self.screencast_settings.lock().await.scale;
+        device_size(w, h, scale)
+    }
+
+    /// When screencasting, restart the screencast so frames follow the current
+    /// viewport at full device resolution. Without this, frames stay capped at
+    /// the size the screencast was started with and get rescaled (blurred) by
+    /// the client. Chrome ignores new limits on a running screencast, hence
+    /// stop + start.
+    pub async fn refresh_screencast(&self) {
+        if !*self.screencasting.lock().await {
+            return;
+        }
+        let Some(client) = self.client_slot.read().await.clone() else {
+            return;
+        };
+        let session_id = self.cdp_session_id.read().await.clone();
+        let (max_w, max_h) = self.screencast_max_size().await;
+        let s = self.screencast_settings.lock().await.clone();
+        let _ = client
+            .send_command_no_params("Page.stopScreencast", session_id.as_deref())
+            .await;
+        let _ = client
+            .send_command(
+                "Page.startScreencast",
+                Some(json!({
+                    "format": s.format,
+                    "quality": s.quality,
+                    "maxWidth": max_w,
+                    "maxHeight": max_h,
+                    "everyNthFrame": 1,
+                })),
+                session_id.as_deref(),
+            )
+            .await;
+    }
+
     /// Override the cached screencast state for explicit CLI start/stop commands.
     pub async fn set_screencasting(&self, active: bool) {
         let mut guard = self.screencasting.lock().await;
@@ -142,6 +196,7 @@ impl StreamServer {
         let cdp_session_id = Arc::new(RwLock::new(None::<String>));
         let viewport_width = Arc::new(Mutex::new(1280u32));
         let viewport_height = Arc::new(Mutex::new(720u32));
+        let screencast_settings = Arc::new(Mutex::new(ScreencastSettings::default()));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let frame_tx_clone = frame_tx.clone();
@@ -180,6 +235,7 @@ impl StreamServer {
         let cdp_session_bg = cdp_session_id.clone();
         let vw_bg = viewport_width.clone();
         let vh_bg = viewport_height.clone();
+        let settings_bg = screencast_settings.clone();
         let cdp_task = tokio::spawn(async move {
             cdp_event_loop(
                 frame_tx_bg,
@@ -190,6 +246,7 @@ impl StreamServer {
                 cdp_session_bg,
                 vw_bg,
                 vh_bg,
+                settings_bg,
                 shutdown_rx,
             )
             .await;
@@ -206,6 +263,7 @@ impl StreamServer {
                 screencasting,
                 viewport_width,
                 viewport_height,
+                screencast_settings,
                 shutdown_tx,
                 accept_task: Mutex::new(Some(accept_task)),
                 cdp_task: Mutex::new(Some(cdp_task)),
@@ -448,6 +506,7 @@ async fn cdp_event_loop(
     cdp_session_id: Arc<RwLock<Option<String>>>,
     viewport_width: Arc<Mutex<u32>>,
     viewport_height: Arc<Mutex<u32>>,
+    screencast_settings: Arc<Mutex<ScreencastSettings>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     loop {
@@ -488,15 +547,17 @@ async fn cdp_event_loop(
                 // Use the current viewport dimensions for screencast
                 let vw = *viewport_width.lock().await;
                 let vh = *viewport_height.lock().await;
+                let settings = screencast_settings.lock().await.clone();
+                let (max_w, max_h) = device_size(vw, vh, settings.scale);
 
                 let _ = client_arc
                     .send_command(
                         "Page.startScreencast",
                         Some(json!({
-                            "format": "jpeg",
-                            "quality": 80,
-                            "maxWidth": vw,
-                            "maxHeight": vh,
+                            "format": settings.format,
+                            "quality": settings.quality,
+                            "maxWidth": max_w,
+                            "maxHeight": max_h,
                             "everyNthFrame": 1,
                         })),
                         session_id.as_deref(),
@@ -703,6 +764,38 @@ pub fn is_allowed_origin(origin: Option<&str>) -> bool {
             }
         }
     }
+}
+
+/// Screencast parameters shared between explicit `screencast_start` and the
+/// auto-started screencast for WebSocket clients.
+#[derive(Clone)]
+pub struct ScreencastSettings {
+    pub scale: f64,
+    pub format: String,
+    pub quality: i32,
+}
+
+impl Default for ScreencastSettings {
+    fn default() -> Self {
+        Self {
+            scale: 1.0,
+            format: "jpeg".to_string(),
+            quality: 80,
+        }
+    }
+}
+
+/// Viewport size in CSS pixels -> frame size in device pixels.
+fn device_size(width: u32, height: u32, scale: f64) -> (i32, i32) {
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    (
+        (width as f64 * scale).ceil() as i32,
+        (height as f64 * scale).ceil() as i32,
+    )
 }
 
 pub async fn start_screencast(

@@ -28,6 +28,9 @@ pub mod providers;
 pub mod recording;
 #[allow(dead_code)]
 pub mod screenshot;
+// app-site
+#[allow(dead_code)]
+pub mod site_data;
 #[allow(dead_code)]
 pub mod snapshot;
 #[allow(dead_code)]

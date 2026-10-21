@@ -207,6 +207,10 @@ const DOCUMENTED_ACTIONS: &[&str] = &[
     "service_workers",
     "service_worker_unregister",
     "service_worker_update",
+    // app-site
+    "manifest",
+    "storage_usage",
+    "clear_site_data",
 ];
 
 fn minimal_command(action: &str, id: &str) -> Value {
@@ -403,6 +407,11 @@ fn minimal_command(action: &str, id: &str) -> Value {
         }
         "service_worker_unregister" | "service_worker_update" => {
             obj.insert("scopeURL".to_string(), json!("https://example.com/"));
+        }
+
+        // app-site
+        "clear_site_data" => {
+            obj.insert("types".to_string(), json!("all"));
         }
         _ => {}
     }

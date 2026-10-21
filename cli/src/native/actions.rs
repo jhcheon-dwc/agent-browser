@@ -30,6 +30,7 @@ use super::policy::{ActionPolicy, ConfirmActions, PolicyResult};
 use super::providers;
 use super::recording::{self, RecordingState};
 use super::screenshot::{self, ScreenshotOptions};
+use super::site_data; // app-site
 use super::snapshot::{self, SnapshotOptions};
 use super::state;
 use super::storage;
@@ -1301,6 +1302,10 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "service_workers" => handle_service_workers(cmd, state).await,
         "service_worker_unregister" => handle_service_worker_command(cmd, state, true).await,
         "service_worker_update" => handle_service_worker_command(cmd, state, false).await,
+        // app-site
+        "manifest" => site_data::handle_manifest(state).await,
+        "storage_usage" => site_data::handle_storage_usage(cmd, state).await,
+        "clear_site_data" => site_data::handle_clear_site_data(cmd, state).await,
         _ => Err(format!("Not yet implemented: {}", action)),
     };
 

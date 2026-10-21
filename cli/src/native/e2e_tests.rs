@@ -3952,3 +3952,173 @@ async fn e2e_cache_storage_and_service_workers() {
     assert_success(&resp);
     server.abort();
 }
+
+// ---------------------------------------------------------------------------
+// app-site: manifest / storage_usage / clear_site_data
+// ---------------------------------------------------------------------------
+
+/// Serves `/` (links a manifest), `/manifest.json` and `/plain` (no manifest).
+async fn start_site_data_server() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base_url = format!("http://127.0.0.1:{}", port);
+
+    let handle = tokio::spawn(async move {
+        for _ in 0..100 {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                let (ctype, body) = match path.as_str() {
+                    "/manifest.json" => (
+                        "application/manifest+json",
+                        r#"{"name":"Site Data Test","short_name":"SDT","start_url":"/","display":"standalone","icons":[{"src":"/icon.png","sizes":"192x192","type":"image/png"}]}"#
+                            .to_string(),
+                    ),
+                    "/plain" => (
+                        "text/html",
+                        "<!doctype html><title>plain</title><p>no manifest</p>".to_string(),
+                    ),
+                    _ => (
+                        "text/html",
+                        r#"<!doctype html><html><head><title>site</title>
+<link rel="manifest" href="/manifest.json"></head><body>site</body></html>"#
+                            .to_string(),
+                    ),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{}",
+                    ctype,
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+
+    (base_url, handle)
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_site_data() {
+    let (base_url, server) = start_site_data_server().await;
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": format!("{}/", base_url) }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Manifest is fetched and parsed.
+    let resp = execute_command(&json!({ "id": "3", "action": "manifest" }), &mut state).await;
+    assert_success(&resp);
+    let data = get_data(&resp);
+    assert_eq!(data["url"], format!("{}/manifest.json", base_url));
+    assert_eq!(data["data"]["name"], "Site Data Test");
+    assert_eq!(data["data"]["display"], "standalone");
+    assert!(data["errors"].is_array());
+
+    // Populate storage of several kinds.
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "evaluate", "script": r#"(async () => {
+            localStorage.setItem('k', 'v'.repeat(1000));
+            document.cookie = 'sd=1; path=/';
+            await new Promise((res, rej) => {
+                const r = indexedDB.open('sddb', 1);
+                r.onupgradeneeded = () => r.result.createObjectStore('s');
+                r.onsuccess = () => {
+                    const tx = r.result.transaction('s', 'readwrite');
+                    tx.objectStore('s').put('x'.repeat(20000), 'a');
+                    tx.oncomplete = () => { r.result.close(); res(); };
+                    tx.onerror = rej;
+                };
+                r.onerror = rej;
+            });
+            const c = await caches.open('sdcache');
+            await c.put('/x', new Response('y'.repeat(5000)));
+            return true;
+        })()"# }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(&json!({ "id": "5", "action": "storage_usage" }), &mut state).await;
+    assert_success(&resp);
+    let data = get_data(&resp);
+    assert_eq!(data["origin"], base_url);
+    assert!(data["usage"].as_f64().unwrap() > 0.0, "usage: {}", data);
+    assert!(data["quota"].as_f64().unwrap() > 0.0);
+    assert!(!data["breakdown"].as_array().unwrap().is_empty());
+
+    // Invalid types are rejected.
+    let resp = execute_command(
+        &json!({ "id": "6", "action": "clear_site_data", "types": "bogus" }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(resp["success"], false);
+
+    // Clear everything.
+    let resp =
+        execute_command(&json!({ "id": "7", "action": "clear_site_data" }), &mut state).await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["cleared"], true);
+    assert_eq!(get_data(&resp)["origin"], base_url);
+
+    let resp = execute_command(
+        &json!({ "id": "8", "action": "evaluate", "script": r#"(async () => ({
+            ls: localStorage.length,
+            cookie: document.cookie,
+            dbs: (await indexedDB.databases()).length,
+            caches: (await caches.keys()).length,
+        }))()"# }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let r = &get_data(&resp)["result"];
+    assert_eq!(r["ls"], 0, "after clear: {}", r);
+    assert_eq!(r["cookie"], "");
+    assert_eq!(r["dbs"], 0);
+    assert_eq!(r["caches"], 0);
+
+    // Page without a manifest: data null, no errors.
+    let resp = execute_command(
+        &json!({ "id": "9", "action": "navigate", "url": format!("{}/plain", base_url) }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(&json!({ "id": "10", "action": "manifest" }), &mut state).await;
+    assert_success(&resp);
+    let data = get_data(&resp);
+    assert!(data["data"].is_null());
+    assert_eq!(data["errors"].as_array().unwrap().len(), 0);
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+    server.abort();
+}

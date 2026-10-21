@@ -269,6 +269,10 @@ pub struct ExceptionDetails {
     pub exception: Option<RemoteObject>,
     pub line_number: Option<i64>,
     pub column_number: Option<i64>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub stack_trace: Option<serde_json::Value>,
 }
 
 // Runtime.consoleAPICalled

@@ -192,6 +192,10 @@ const DOCUMENTED_ACTIONS: &[&str] = &[
     "mousemove",
     "mousedown",
     "mouseup",
+    // app-site
+    "manifest",
+    "storage_usage",
+    "clear_site_data",
 ];
 
 fn minimal_command(action: &str, id: &str) -> Value {
@@ -364,6 +368,10 @@ fn minimal_command(action: &str, id: &str) -> Value {
         }
         "inserttext" => {
             obj.insert("text".to_string(), json!("test"));
+        }
+        // app-site
+        "clear_site_data" => {
+            obj.insert("types".to_string(), json!("all"));
         }
         _ => {}
     }

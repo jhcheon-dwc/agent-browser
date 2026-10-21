@@ -6,6 +6,46 @@ use super::cdp::client::CdpClient;
 use super::cdp::types::*;
 use super::element::{resolve_element_center, resolve_element_object_id, RefMap};
 
+/// Scroll the element into the viewport when any part of it is outside, so
+/// the coordinates `resolve_element_center` returns land on it. Input events
+/// at off-screen coordinates hit nothing (e.g. a link below the fold in a
+/// short viewport). Best effort: resolution errors surface from the caller.
+async fn scroll_into_view_if_needed(
+    client: &CdpClient,
+    session_id: &str,
+    ref_map: &RefMap,
+    selector_or_ref: &str,
+    iframe_sessions: &HashMap<String, String>,
+) {
+    let Ok((object_id, effective_session_id)) = resolve_element_object_id(
+        client,
+        session_id,
+        ref_map,
+        selector_or_ref,
+        iframe_sessions,
+    )
+    .await
+    else {
+        return;
+    };
+    let _ = client
+        .send_command_typed::<_, Value>(
+            "Runtime.callFunctionOn",
+            &CallFunctionOnParams {
+                function_declaration: "function() { const r = this.getBoundingClientRect(); \
+                    if (r.top < 0 || r.left < 0 || r.bottom > innerHeight || r.right > innerWidth) \
+                    this.scrollIntoView({ block: 'center', inline: 'center' }); }"
+                    .to_string(),
+                object_id: Some(object_id),
+                arguments: None,
+                return_by_value: Some(true),
+                await_promise: Some(false),
+            },
+            Some(&effective_session_id),
+        )
+        .await;
+}
+
 pub async fn click(
     client: &CdpClient,
     session_id: &str,
@@ -15,6 +55,7 @@ pub async fn click(
     click_count: i32,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<(), String> {
+    scroll_into_view_if_needed(client, session_id, ref_map, selector_or_ref, iframe_sessions).await;
     let (x, y, effective_session_id) = resolve_element_center(
         client,
         session_id,
@@ -52,6 +93,7 @@ pub async fn hover(
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<(), String> {
+    scroll_into_view_if_needed(client, session_id, ref_map, selector_or_ref, iframe_sessions).await;
     let (x, y, effective_session_id) = resolve_element_center(
         client,
         session_id,
@@ -850,6 +892,7 @@ pub async fn tap_touch(
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<(), String> {
+    scroll_into_view_if_needed(client, session_id, ref_map, selector_or_ref, iframe_sessions).await;
     let (x, y, effective_session_id) = resolve_element_center(
         client,
         session_id,

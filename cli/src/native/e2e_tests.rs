@@ -3463,3 +3463,226 @@ async fn e2e_headers_case_insensitive_no_duplicates() {
     let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
     assert_success(&resp);
 }
+
+// ---------------------------------------------------------------------------
+// app-cache-sw: Cache Storage + Service Workers
+// ---------------------------------------------------------------------------
+
+/// Serves `/` (registers `/sw.js` and fills caches `v1` (two entries) and
+/// `v2` (empty)) and `/sw.js` until the returned handle is aborted.
+async fn start_cache_sw_server() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base_url = format!("http://127.0.0.1:{}", port);
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let path = request.split_whitespace().nth(1).unwrap_or("/");
+                let (ctype, body) = if path.starts_with("/sw.js") {
+                    (
+                        "text/javascript",
+                        "self.addEventListener('install', () => self.skipWaiting());\n\
+                         self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));\n",
+                    )
+                } else {
+                    (
+                        "text/html",
+                        "<html><body>cache-sw<script>\n\
+                         (async () => {\n\
+                           const c = await caches.open('v1');\n\
+                           await c.put('/a.txt', new Response('a'));\n\
+                           await c.put('/b.txt', new Response('b'));\n\
+                           await caches.open('v2');\n\
+                           await navigator.serviceWorker.register('/sw.js');\n\
+                           await navigator.serviceWorker.ready;\n\
+                           window.__ready = true;\n\
+                         })().catch(e => { window.__err = String(e); });\n\
+                         </script></body></html>",
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{}",
+                    ctype,
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+
+    (base_url, handle)
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_cache_storage_and_service_workers() {
+    let (base_url, server) = start_cache_sw_server().await;
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": format!("{}/", base_url) }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "waitforfunction", "expression": "window.__ready === true || window.__err", "timeout": 15000 }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "3b", "action": "evaluate", "script": "window.__err || ''" }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(get_data(&resp)["result"], "", "test page setup failed");
+
+    // --- Cache Storage ---
+    let resp = execute_command(&json!({ "id": "4", "action": "cache_list" }), &mut state).await;
+    assert_success(&resp);
+    let data = get_data(&resp);
+    assert_eq!(data["origin"], base_url.as_str());
+    let caches = data["caches"].as_array().unwrap();
+    let names: Vec<&str> = caches
+        .iter()
+        .filter_map(|c| c["cacheName"].as_str())
+        .collect();
+    assert_eq!(names, vec!["v1", "v2"], "caches: {}", data);
+    let v1 = caches[0]["cacheId"].as_str().unwrap().to_string();
+    let v2 = caches[1]["cacheId"].as_str().unwrap().to_string();
+
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "cache_entries", "cacheId": v1 }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let data = get_data(&resp);
+    assert_eq!(data["total"], 2, "entries: {}", data);
+    let entries = data["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["requestMethod"], "GET");
+    assert_eq!(entries[0]["responseStatus"], 200);
+
+    // Paging
+    let resp = execute_command(
+        &json!({ "id": "6", "action": "cache_entries", "cacheId": v1, "skip": 1, "limit": 1 }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["entries"].as_array().unwrap().len(), 1);
+
+    // Delete one entry
+    let url_a = format!("{}/a.txt", base_url);
+    let resp = execute_command(
+        &json!({ "id": "7", "action": "cache_delete", "cacheId": v1, "requestURL": url_a }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["deleted"], true);
+    let resp = execute_command(
+        &json!({ "id": "8", "action": "evaluate", "script": "caches.open('v1').then(c => c.keys()).then(k => k.map(r => r.url).join(','))" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["result"], format!("{}/b.txt", base_url));
+
+    // Delete a whole cache
+    let resp = execute_command(
+        &json!({ "id": "9", "action": "cache_delete", "cacheId": v2 }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(&json!({ "id": "10", "action": "cache_list" }), &mut state).await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["caches"].as_array().unwrap().len(), 1);
+
+    // --- Service Workers ---
+    let scope = format!("{}/", base_url);
+    let resp =
+        execute_command(&json!({ "id": "11", "action": "service_workers" }), &mut state).await;
+    assert_success(&resp);
+    let regs = get_data(&resp)["registrations"].as_array().unwrap().clone();
+    assert_eq!(regs.len(), 1, "registrations: {:?}", regs);
+    assert_eq!(regs[0]["scopeURL"], scope.as_str());
+    assert_eq!(regs[0]["scriptURL"], format!("{}/sw.js", base_url));
+    assert_eq!(regs[0]["status"], "activated");
+    assert!(!regs[0]["registrationId"].as_str().unwrap().is_empty());
+
+    let resp = execute_command(
+        &json!({ "id": "12", "action": "service_worker_update", "scopeURL": scope }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["ok"], true);
+
+    // Unknown scope is an error rather than a silent no-op
+    let resp = execute_command(
+        &json!({ "id": "13", "action": "service_worker_unregister", "scopeURL": format!("{}/nope/", base_url) }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(resp["success"], false);
+    // Other origins cannot be targeted from this page
+    let resp = execute_command(
+        &json!({ "id": "13b", "action": "service_worker_update", "scopeURL": "https://example.com/" }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(resp["success"], false);
+    // An empty entry URL is rejected instead of wiping the cache
+    let resp = execute_command(
+        &json!({ "id": "13c", "action": "cache_delete", "cacheId": v1, "requestURL": "" }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(resp["success"], false);
+
+    let resp = execute_command(
+        &json!({ "id": "14", "action": "service_worker_unregister", "scopeURL": scope }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "15", "action": "waitforfunction", "expression": "(navigator.serviceWorker.getRegistrations().then(r => { window.__swn = r.length; }), window.__swn === 0)", "timeout": 5000 }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp =
+        execute_command(&json!({ "id": "16", "action": "service_workers" }), &mut state).await;
+    assert_success(&resp);
+    assert!(get_data(&resp)["registrations"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+    server.abort();
+}

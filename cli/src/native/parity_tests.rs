@@ -192,6 +192,13 @@ const DOCUMENTED_ACTIONS: &[&str] = &[
     "mousemove",
     "mousedown",
     "mouseup",
+    // app-cache-sw
+    "cache_list",
+    "cache_entries",
+    "cache_delete",
+    "service_workers",
+    "service_worker_unregister",
+    "service_worker_update",
 ];
 
 fn minimal_command(action: &str, id: &str) -> Value {
@@ -364,6 +371,13 @@ fn minimal_command(action: &str, id: &str) -> Value {
         }
         "inserttext" => {
             obj.insert("text".to_string(), json!("test"));
+        }
+        // app-cache-sw
+        "cache_entries" | "cache_delete" => {
+            obj.insert("cacheId".to_string(), json!("none"));
+        }
+        "service_worker_unregister" | "service_worker_update" => {
+            obj.insert("scopeURL".to_string(), json!("https://example.com/"));
         }
         _ => {}
     }

@@ -39,6 +39,9 @@ use super::webdriver::appium::AppiumManager;
 use super::webdriver::backend::{BrowserBackend, WebDriverBackend, WEBDRIVER_UNSUPPORTED_ACTIONS};
 use super::webdriver::ios;
 use super::webdriver::safari;
+// app-cache-sw
+use super::cache_storage;
+use super::service_worker;
 
 /// Wait strategy used by `auth_login` when navigating to the login page.
 ///
@@ -1281,6 +1284,13 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "mousemove" => handle_mousemove(cmd, state).await,
         "mousedown" => handle_mousedown(cmd, state).await,
         "mouseup" => handle_mouseup(cmd, state).await,
+        // app-cache-sw
+        "cache_list" => handle_cache_list(cmd, state).await,
+        "cache_entries" => handle_cache_entries(cmd, state).await,
+        "cache_delete" => handle_cache_delete(cmd, state).await,
+        "service_workers" => handle_service_workers(cmd, state).await,
+        "service_worker_unregister" => handle_service_worker_command(cmd, state, true).await,
+        "service_worker_update" => handle_service_worker_command(cmd, state, false).await,
         _ => Err(format!("Not yet implemented: {}", action)),
     };
 
@@ -2955,6 +2965,68 @@ async fn handle_storage_clear(cmd: &Value, state: &DaemonState) -> Result<Value,
     let storage_type = cmd.get("type").and_then(|v| v.as_str()).unwrap_or("local");
     storage::storage_clear(&mgr.client, &session_id, storage_type).await?;
     Ok(json!({ "cleared": true }))
+}
+
+// app-cache-sw
+async fn handle_cache_list(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
+    let origin = cmd.get("origin").and_then(|v| v.as_str());
+    cache_storage::cache_list(&mgr.client, &session_id, origin).await
+}
+
+async fn handle_cache_entries(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
+    let cache_id = cmd
+        .get("cacheId")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing 'cacheId' parameter")?;
+    let skip = cmd.get("skip").and_then(|v| v.as_u64()).unwrap_or(0);
+    let limit = cmd.get("limit").and_then(|v| v.as_u64()).unwrap_or(50);
+    cache_storage::cache_entries(&mgr.client, &session_id, cache_id, skip, limit).await
+}
+
+async fn handle_cache_delete(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
+    let cache_id = cmd
+        .get("cacheId")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing 'cacheId' parameter")?;
+    // An explicitly empty requestURL is an error, never "delete the whole cache".
+    let request_url = match cmd.get("requestURL") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_str()
+                .filter(|u| !u.is_empty())
+                .ok_or("'requestURL' must be a non-empty string")?,
+        ),
+    };
+    cache_storage::cache_delete(&mgr.client, &session_id, cache_id, request_url).await
+}
+
+async fn handle_service_workers(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
+    let origin = cmd.get("origin").and_then(|v| v.as_str());
+    service_worker::service_workers(&mgr.client, &session_id, origin).await
+}
+
+async fn handle_service_worker_command(
+    cmd: &Value,
+    state: &DaemonState,
+    unregister: bool,
+) -> Result<Value, String> {
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
+    let scope_url = cmd
+        .get("scopeURL")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing 'scopeURL' parameter")?;
+    let origin = cmd.get("origin").and_then(|v| v.as_str());
+    service_worker::service_worker_command(&mgr.client, &session_id, scope_url, origin, unregister)
+        .await
 }
 
 async fn handle_setcontent(cmd: &Value, state: &DaemonState) -> Result<Value, String> {

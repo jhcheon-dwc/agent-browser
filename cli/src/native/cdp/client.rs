@@ -110,9 +110,17 @@ impl CdpClient {
 
                 let parsed: CdpMessage = match serde_json::from_str(&msg) {
                     Ok(m) => m,
-                    // Expected for inspect proxy messages with negative IDs
-                    // (CdpMessage.id is u64); handled via raw broadcast above.
-                    Err(_) => continue,
+                    // app-idb: Chrome can emit unpaired UTF-16 surrogate
+                    // escapes (e.g. a string preview abbreviated mid-emoji
+                    // in IndexedDB.requestData), which serde_json rejects.
+                    // Dropping the frame would stall the command until its
+                    // timeout, so retry with those escapes replaced.
+                    Err(_) => match serde_json::from_str(&replace_lone_surrogates(&msg)) {
+                        Ok(m) => m,
+                        // Expected for inspect proxy messages with negative IDs
+                        // (CdpMessage.id is u64); handled via raw broadcast above.
+                        Err(_) => continue,
+                    },
                 };
 
                 if let Some(id) = parsed.id {
@@ -326,4 +334,65 @@ fn enable_tcp_keepalive(stream: &tokio_tungstenite::MaybeTlsStream<tokio::net::T
     let keepalive = keepalive.with_interval(std::time::Duration::from_secs(10));
 
     let _ = sock.set_tcp_keepalive(&keepalive);
+}
+
+// app-idb
+/// Replaces `\uXXXX` escapes of unpaired UTF-16 surrogates in JSON text
+/// with `\ufffd`; paired surrogates and escaped backslashes are kept.
+fn replace_lone_surrogates(json: &str) -> String {
+    fn hex4(b: &[u8], at: usize) -> Option<u16> {
+        let s = std::str::from_utf8(b.get(at..at + 4)?).ok()?;
+        u16::from_str_radix(s, 16).ok()
+    }
+    let b = json.as_bytes();
+    let mut out = String::with_capacity(json.len());
+    let mut last = 0;
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        if b.get(i + 1) != Some(&b'u') {
+            i += 2; // other escape (incl. `\\`): skip both bytes
+            continue;
+        }
+        let Some(cu) = hex4(b, i + 2) else {
+            i += 2;
+            continue;
+        };
+        let paired_low = |j: usize| {
+            b.get(j) == Some(&b'\\')
+                && b.get(j + 1) == Some(&b'u')
+                && hex4(b, j + 2).is_some_and(|c| (0xDC00..=0xDFFF).contains(&c))
+        };
+        match cu {
+            0xD800..=0xDBFF if paired_low(i + 6) => i += 12,
+            0xD800..=0xDFFF => {
+                out.push_str(&json[last..i]);
+                out.push_str("\\ufffd");
+                i += 6;
+                last = i;
+            }
+            _ => i += 6,
+        }
+    }
+    out.push_str(&json[last..]);
+    out
+}
+
+#[cfg(test)]
+mod lone_surrogate_tests {
+    use super::replace_lone_surrogates as fix;
+
+    #[test]
+    fn keeps_valid_and_replaces_unpaired() {
+        assert_eq!(fix(r#""😀 한""#), r#""😀 한""#);
+        assert_eq!(fix(r#""ab\ud83d""#), r#""ab\ufffd""#);
+        assert_eq!(fix(r#""\ude00x""#), r#""\ufffdx""#);
+        assert_eq!(fix(r#""\\ud83d""#), r#""\\ud83d""#);
+        assert_eq!(fix(r#""\ud83d\n""#), r#""\ufffd\n""#);
+        let v: serde_json::Value = serde_json::from_str(&fix(r#"{"s":"x\ud83d"}"#)).unwrap();
+        assert_eq!(v["s"], "x\u{fffd}");
+    }
 }

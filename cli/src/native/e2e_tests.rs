@@ -3558,3 +3558,174 @@ async fn e2e_storage_remove_and_cookie_delete() {
     let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
     assert_success(&resp);
 }
+
+// ---------------------------------------------------------------------------
+// app-idb: IndexedDB inspection
+// ---------------------------------------------------------------------------
+
+/// JS that creates `cmux-e2e` with a keyPath store and an autoIncrement
+/// store (+ index), seeded with Korean text, resolving once committed.
+const IDB_SEED_JS: &str = r#"new Promise((resolve, reject) => {
+  const req = indexedDB.open('cmux-e2e', 2);
+  req.onupgradeneeded = () => {
+    const db = req.result;
+    db.createObjectStore('users', { keyPath: 'id' });
+    const notes = db.createObjectStore('notes', { autoIncrement: true });
+    notes.createIndex('by_tag', 'tag', { unique: false });
+  };
+  req.onerror = () => reject(req.error);
+  req.onsuccess = () => {
+    const db = req.result;
+    const tx = db.transaction(['users', 'notes'], 'readwrite');
+    tx.objectStore('users').put({ id: 1, name: '김철수', tags: ['a', 'b'] });
+    tx.objectStore('users').put({ id: 2, name: 'Bob', when: new Date(0) });
+    // Long values whose 2 KB cut lands on either half of a surrogate pair.
+    tx.objectStore('users').put({ id: 3, big: '😀'.repeat(1500) });
+    tx.objectStore('users').put({ id: 4, big: 'x' + '😀'.repeat(1500) });
+    const shared = { x: 1 };
+    tx.objectStore('users').put({ id: 5, a: shared, b: shared, m: new Map([['k', 1]]) });
+    for (let i = 0; i < 5; i++) tx.objectStore('notes').add({ tag: 't' + (i % 2), text: '메모 ' + i });
+    tx.oncomplete = () => { db.close(); resolve('ok'); };
+    tx.onerror = () => reject(tx.error);
+  };
+})"#;
+
+#[tokio::test]
+#[ignore]
+async fn e2e_indexeddb() {
+    let (base_url, _server) = start_echo_server().await;
+    let mut state = DaemonState::new();
+    let mut n = 0;
+    let mut run = |cmd: Value| {
+        n += 1;
+        let mut cmd = cmd;
+        cmd["id"] = json!(n.to_string());
+        cmd
+    };
+
+    let resp = execute_command(&run(json!({ "action": "launch", "headless": true })), &mut state).await;
+    assert_success(&resp);
+    let resp = execute_command(&run(json!({ "action": "navigate", "url": base_url })), &mut state).await;
+    assert_success(&resp);
+    let resp = execute_command(&run(json!({ "action": "evaluate", "script": IDB_SEED_JS })), &mut state).await;
+    assert_success(&resp);
+
+    // List databases with schema.
+    let resp = execute_command(&run(json!({ "action": "indexeddb_databases" })), &mut state).await;
+    assert_success(&resp);
+    let data = get_data(&resp);
+    assert_eq!(data["origin"], base_url.as_str());
+    let db = data["databases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "cmux-e2e")
+        .expect("cmux-e2e listed")
+        .clone();
+    assert_eq!(db["version"], 2);
+    let stores = db["objectStores"].as_array().unwrap();
+    let users = stores.iter().find(|s| s["name"] == "users").unwrap();
+    assert_eq!(users["keyPath"], "id");
+    assert_eq!(users["autoIncrement"], false);
+    let notes = stores.iter().find(|s| s["name"] == "notes").unwrap();
+    assert_eq!(notes["keyPath"], Value::Null);
+    assert_eq!(notes["autoIncrement"], true);
+    assert_eq!(notes["indexes"][0]["name"], "by_tag");
+    assert_eq!(notes["indexes"][0]["keyPath"], "tag");
+
+    // Records render as JSON-ish previews (Korean intact).
+    let resp = execute_command(
+        &run(json!({ "action": "indexeddb_data", "database": "cmux-e2e", "store": "users" })),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let entries = get_data(&resp)["entries"].as_array().unwrap().clone();
+    assert_eq!(entries.len(), 5);
+    assert_eq!(entries[0]["key"], "1");
+    assert_eq!(entries[0]["primaryKey"], "1");
+    let v0 = entries[0]["value"].as_str().unwrap();
+    assert!(v0.contains("김철수") && v0.contains("\"tags\""), "value: {}", v0);
+    for big in &entries[2..4] {
+        let v = big["value"].as_str().unwrap();
+        assert!(v.len() <= 2048 && v.ends_with('…'), "len {}: {}", v.len(), v);
+        assert!(v.contains('😀'));
+    }
+    let v4 = entries[4]["value"].as_str().unwrap();
+    assert_eq!(v4, r#"{"id":5,"a":{"x":1},"b":{"x":1},"m":{"[[Map]]":[["k",1]]}}"#);
+    assert_eq!(get_data(&resp)["hasMore"], false);
+
+    // `database` filter on the listing.
+    let resp = execute_command(
+        &run(json!({ "action": "indexeddb_databases", "database": "nope" })),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert!(get_data(&resp)["databases"].as_array().unwrap().is_empty());
+
+    // Paging.
+    let resp = execute_command(
+        &run(json!({ "action": "indexeddb_data", "database": "cmux-e2e", "store": "notes", "skip": 1, "limit": 2 })),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let entries = get_data(&resp)["entries"].as_array().unwrap().clone();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["key"], "2");
+    assert!(entries[0]["value"].as_str().unwrap().contains("메모 1"));
+    assert_eq!(get_data(&resp)["hasMore"], true);
+
+    // Through an index: key is the index key, primaryKey the record key.
+    let resp = execute_command(
+        &run(json!({ "action": "indexeddb_data", "database": "cmux-e2e", "store": "notes", "index": "by_tag", "limit": 50 })),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let entries = get_data(&resp)["entries"].as_array().unwrap().clone();
+    assert_eq!(entries.len(), 5);
+    assert_eq!(entries[0]["key"], "\"t0\"");
+
+    // Clear a store.
+    let resp = execute_command(
+        &run(json!({ "action": "indexeddb_clear", "database": "cmux-e2e", "store": "notes" })),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &run(json!({ "action": "indexeddb_data", "database": "cmux-e2e", "store": "notes" })),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert!(get_data(&resp)["entries"].as_array().unwrap().is_empty());
+
+    // Delete the database.
+    let resp = execute_command(
+        &run(json!({ "action": "indexeddb_delete", "database": "cmux-e2e" })),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &run(json!({ "action": "evaluate", "script": "indexedDB.databases().then(d => d.map(x => x.name))" })),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert!(
+        !get_data(&resp)["result"].as_array().unwrap().iter().any(|n| n == "cmux-e2e"),
+        "database should be gone: {}",
+        get_data(&resp)
+    );
+
+    // Missing params are rejected before touching CDP.
+    let resp = execute_command(&run(json!({ "action": "indexeddb_data", "database": "cmux-e2e" })), &mut state).await;
+    assert_eq!(resp["success"], false);
+
+    let resp = execute_command(&run(json!({ "action": "close" })), &mut state).await;
+    assert_success(&resp);
+}

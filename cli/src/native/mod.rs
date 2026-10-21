@@ -40,6 +40,9 @@ pub mod stream;
 pub mod tracing;
 #[allow(dead_code)]
 pub mod webdriver;
+// app-idb
+#[allow(dead_code)]
+pub mod indexeddb;
 
 #[cfg(test)]
 mod e2e_tests;

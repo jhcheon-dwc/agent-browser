@@ -39,6 +39,8 @@ use super::webdriver::appium::AppiumManager;
 use super::webdriver::backend::{BrowserBackend, WebDriverBackend, WEBDRIVER_UNSUPPORTED_ACTIONS};
 use super::webdriver::ios;
 use super::webdriver::safari;
+// app-idb
+use super::indexeddb;
 
 /// Wait strategy used by `auth_login` when navigating to the login page.
 ///
@@ -1284,6 +1286,11 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         // app-storage
         "storage_remove" => handle_storage_remove(cmd, state).await,
         "cookies_delete" => handle_cookies_delete(cmd, state).await,
+        // app-idb
+        "indexeddb_databases" => handle_indexeddb_databases(cmd, state).await,
+        "indexeddb_data" => handle_indexeddb_data(cmd, state).await,
+        "indexeddb_clear" => handle_indexeddb_clear(cmd, state).await,
+        "indexeddb_delete" => handle_indexeddb_delete(cmd, state).await,
         _ => Err(format!("Not yet implemented: {}", action)),
     };
 
@@ -2997,6 +3004,44 @@ async fn handle_cookies_delete(cmd: &Value, state: &DaemonState) -> Result<Value
     )
     .await?;
     Ok(json!({ "deleted": true }))
+}
+
+// app-idb
+/// CDP client, active session and optional `origin` override for the
+/// IndexedDB actions.
+fn idb_context<'a>(
+    cmd: &'a Value,
+    state: &'a DaemonState,
+) -> Result<(&'a CdpClient, String, Option<&'a str>), String> {
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
+    let origin = cmd.get("origin").and_then(|v| v.as_str());
+    Ok((&mgr.client, session_id, origin))
+}
+
+async fn handle_indexeddb_databases(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+    let (client, session_id, origin) = idb_context(cmd, state)?;
+    let only = cmd.get("database").and_then(|v| v.as_str());
+    indexeddb::databases(client, &session_id, origin, only).await
+}
+
+async fn handle_indexeddb_data(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+    let params = indexeddb::parse_data_params(cmd)?;
+    let (client, session_id, origin) = idb_context(cmd, state)?;
+    indexeddb::data(client, &session_id, origin, &params).await
+}
+
+async fn handle_indexeddb_clear(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+    let database = indexeddb::required_str(cmd, "database")?;
+    let store = indexeddb::required_str(cmd, "store")?;
+    let (client, session_id, origin) = idb_context(cmd, state)?;
+    indexeddb::clear_store(client, &session_id, origin, &database, &store).await
+}
+
+async fn handle_indexeddb_delete(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+    let database = indexeddb::required_str(cmd, "database")?;
+    let (client, session_id, origin) = idb_context(cmd, state)?;
+    indexeddb::delete_database(client, &session_id, origin, &database).await
 }
 
 async fn handle_setcontent(cmd: &Value, state: &DaemonState) -> Result<Value, String> {

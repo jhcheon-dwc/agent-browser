@@ -195,6 +195,11 @@ const DOCUMENTED_ACTIONS: &[&str] = &[
     // app-storage
     "storage_remove",
     "cookies_delete",
+    // app-idb
+    "indexeddb_databases",
+    "indexeddb_data",
+    "indexeddb_clear",
+    "indexeddb_delete",
 ];
 
 fn minimal_command(action: &str, id: &str) -> Value {
@@ -374,6 +379,15 @@ fn minimal_command(action: &str, id: &str) -> Value {
         }
         "cookies_delete" => {
             obj.insert("name".to_string(), json!("test"));
+        }
+
+        // app-idb
+        "indexeddb_data" | "indexeddb_clear" => {
+            obj.insert("database".to_string(), json!("db"));
+            obj.insert("store".to_string(), json!("store"));
+        }
+        "indexeddb_delete" => {
+            obj.insert("database".to_string(), json!("db"));
         }
         _ => {}
     }
